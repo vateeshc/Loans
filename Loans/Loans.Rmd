@@ -1,0 +1,520 @@
+---
+title: "Loans"
+output: html_document
+---
+#setup libraries and working directory
+```{r}
+setwd("~/Downloads/Loans")
+load("~/Downloads/Loans/.RData")
+```
+
+```{r}
+
+# General 
+library(tidyverse)
+library(skimr)
+library(ggplot2)
+library(reshape2)
+
+# date
+library(lubridate)
+
+#track time
+#devtools::install_github("jabiru/tictoc")
+library(tictoc)
+
+#install.packages("Hmisc")
+library(Hmisc)
+
+
+```
+
+
+##import csv file
+```{r loans}
+loans <- read_csv("Loans.csv")
+
+```
+
+## Explore data
+
+```{r explore, echo=FALSE}
+spec(loans)
+head(loans)
+summary(loans)
+
+#data types
+data_types <- function(frame) {
+  res <- lapply(frame, class)
+  res_frame <- data.frame(unlist(res))
+  barplot(table(res_frame), main="Data Types in Loan data", col="steelblue", ylab="Number of Features")
+}
+data_types(loans)
+
+#Loan default rate
+
+loans %>% group_by(loan_defaulted) %>% summarise(count = n())
+loans %>% summarise(rate = mean(loan_defaulted))
+```
+
+##Total NAs
+```{r}
+sum(is.na(loans))/(nrow(loans)*ncol(loans)) 
+
+```
+
+## Missing character data
+```{r}
+missing_character_values_tbl <- loans %>%
+    select_if(is.character) %>%
+    map_df(~ is.na(.) %>% sum()) %>%
+    gather() %>%
+    arrange(desc(value)) %>%
+    mutate(key = as_factor(key))
+
+missing_character_values_tbl
+```
+
+
+
+##Missing numeric data
+```{r}
+missing_numeric_values_tbl <- loans %>%
+    select_if(is.numeric) %>%
+    map_df(~ is.na(.) %>% sum()) %>%
+    gather() %>%
+    arrange(desc(value)) %>%
+    mutate(key = as_factor(key))
+
+missing_numeric_values_tbl
+
+
+
+```
+
+#Missing annual income
+```{r}
+loans%>%filter(is.na(annual_inc))
+```
+
+#desc vs. purpose deep dive
+I have seen some cases where the identified puprose category does not match the desc. A proper deep dive into desc text in "Phase 2 For now will use purpose feature in modelling as I suspect the vast majority of cases would be accurate (80/20 approach)"
+```{r}
+loans %>% select( purpose, title,desc)%>% unique()%>% arrange(purpose) %>%group_by(purpose)%>%top_n(10)
+```
+
+#emp title deep dive (Phase 2)
+```{r}
+loans %>% select(emp_title)%>% group_by(emp_title)%>% summarise(count=n())%>%arrange(desc(count))
+```
+
+#Unique character values
+```{r}
+loans %>% select_if(is.character) %>% names()
+
+unique_character_values_tbl <- loans %>%
+    select_if(is.character) %>%
+    map_df(~ unique(.) %>% length()) %>%
+    gather() %>%
+    arrange(value) %>%
+    mutate(key = as_factor(key))
+
+unique_character_values_tbl
+
+```
+
+#Unique numeric values
+```{r}
+loans %>% select_if(is.numeric) %>% names()
+
+unique_numeric_values_tbl <- loans %>%
+    select_if(is.numeric) %>%
+    map_df(~ unique(.) %>% length()) %>%
+    gather() %>%
+    arrange(value) %>%
+    mutate(key = as_factor(key))
+
+unique_numeric_values_tbl
+
+```
+
+#drop features due too many missing, unary type, too many unique levels or correlated features.
+Note: emp_title("Phase 2")
+```{r}
+drop_features <- c("initial_list_status","mths_since_last_major_derog","mths_since_last_record","desc"
+                   ,"title","policy_code","emp_title")
+
+loans01 <- loans %>% select(-drop_features)
+
+head(loans01)
+```
+
+#Impute and transform numeric features
+Note: for analysis purposes mean value imputation is being completed pre-modelling, however, going forward best practice is to incorporate during modelling based on n-cross validation to ensure robust modelling outcomes and minimising and leakage and/or overtraining.
+```{r}
+replace_with_0 <- c("mths_since_last_delinq","delinq_2yrs","inq_last_6mths","open_acc","pub_rec","total_acc")
+
+
+# Replace missing values with 0
+for (i in seq_along(replace_with_0)){
+loans01[is.na(loans01[,replace_with_0[i]]), replace_with_0[i]] <- 0
+}
+
+
+#Replace missing with mean value
+
+mean_revol_util<-loans01 %>% select_("revol_util") %>% summarise(mean(revol_util,na.rm = TRUE))
+mean_annual_inc <- loans01 %>% select_("annual_inc") %>% summarise(mean(annual_inc,na.rm = TRUE))
+loans01 %>% filter(revol_bal==0)
+
+loans01[is.na(loans01[,"revol_util"]), "revol_util"] <- mean_revol_util
+loans01[is.na(loans01[,"annual_inc"]), "annual_inc"] <- mean_annual_inc
+
+#Log transform right skewed features
+loans01$annual_inc_log <- log(loans01$annual_inc+1)
+loans01$loan_amnt_log <- log(loans01$loan_amnt+1)
+loans01$funded_amnt_log <- log(loans01$funded_amnt+1)
+loans01$revol_bal_log <- log(loans01$revol_bal+1)
+loans01$installment_log <- log(loans01$installment+1)
+
+
+
+#New features based on business knowledge/interactions
+loans01$funded_loan_amnt_ratio <- (loans01$funded_amnt/loans01$loan_amnt)^3
+loans01$installment_inc_ratio <- 12*loans01$installment/loans01$annual_inc
+loans01$open_total_acc_ratio <- ifelse(loans01$total_acc==0,0,loans01$open_acc/(loans01$total_acc))
+```
+
+#Impute character features and change to factors
+```{r}
+#categorise numeric features
+loans01$pub_rec_flag <- as.factor(ifelse(loans01$pub_rec>0,1,loans01$pub_rec))
+```
+
+#Convert character to date and numeric
+```{r}
+#new features
+#earliest_cr_line
+loans01 %>% group_by(earliest_cr_line) %>% summarise(count=n()) %>% arrange(earliest_cr_line)
+loans01$earliest_cr_line_date <-  as.Date(loans01$earliest_cr_line,"%m/%d/%Y",na.action(omit))
+loans01$earliest_cr_line_years <- as.numeric(time_length(interval(loans01$earliest_cr_line_date,as.Date("2018-01-01")),"years"))
+
+#impute missing numeric for earliest_cr_years
+mean_earliest_cr_line_years <- loans01 %>% select_("earliest_cr_line_years") %>% summarise(mean(earliest_cr_line_years,na.rm = TRUE))
+loans01[is.na(loans01[,"earliest_cr_line_years"]), "earliest_cr_line_years"] <- mean_earliest_cr_line_years
+
+loans01 %>% filter(is.na(earliest_cr_line))
+head(loans01)
+
+loans01 %>% group_by(term) %>% summarise(count=n())
+loans01 %>% group_by(purpose) %>% summarise(count=n())
+
+
+#convert to integer/numeric
+loans01 %>% group_by(int_rate) %>% summarise(count=n())
+loans01$int_rate_num <- as.numeric(gsub("%","",loans01$int_rate))
+
+loans01 %>% group_by(emp_length) %>% summarise(count=n()) %>% arrange(desc(count))
+loans01$emp_length_num <- as.numeric(gsub("\\D","",loans01$emp_length))
+loans01 %>% filter(emp_length=="n/a") %>% select(emp_length,emp_length_num,annual_inc,loan_defaulted)
+
+#impute missing numeric for emp_length
+mean_emp_length <- loans01 %>% select_("emp_length_num") %>% summarise(mean(emp_length_num,na.rm = TRUE))
+loans01[is.na(loans01[,"emp_length_num"]), "emp_length_num"] <- mean_emp_length
+
+
+
+
+
+#target encode these during modelling on h2o - too many levels !!!!
+loans01 %>% group_by(sub_grade) %>% summarise(count=n())
+loans01 %>% group_by(addr_state) %>% summarise(count=n())
+loans01 %>% group_by(zip_code) %>% summarise(count=n())
+
+
+```
+
+#Verification_status clean up
+```{r}
+loans01 %>% group_by(pymnt_plan) %>% summarise(count=n(), default=mean(loan_defaulted))
+loans01 %>% group_by(verification_status) %>% summarise(count=n(), default=mean(loan_defaulted))
+
+#clean up verification status
+loans01$verification_status_income <- as.factor(ifelse(loans01$verification_status=="not verified",0,1))
+loans01 %>% group_by(verification_status_income) %>% summarise(count=n(), default=mean(loan_defaulted))
+
+```
+#convert all character features to factor
+```{r}
+loans01 <- loans01 %>% mutate_if(sapply(loans01,is.character),as.factor)
+sapply(loans01,class)  
+```
+
+#bar graph showing count by category
+```{r}
+head(loans01)
+
+char_var_names<- loans01 %>%
+  select_if(is.factor) %>%
+   names() %>%
+  as.list()
+
+char_var_names
+
+for (i in seq(char_var_names)){
+ g <- ggplot(loans01,aes_string(char_var_names[[i]])) + geom_bar(aes(fill=as.factor(loan_defaulted))) + coord_flip()
+  print(g)
+}
+
+
+```
+
+#stacked bar graph showing proportion by category
+```{r}
+for (i in seq(char_var_names)){
+ g <- ggplot(loans01,aes_string(char_var_names[[i]])) + geom_bar(aes(fill=as.factor(loan_defaulted)),position="fill") +
+  ylab("Proportion per category") + coord_flip()
+  print(g)
+}
+
+```
+
+
+#density plots of numeric features
+
+```{r}
+num_var_names<- loans01 %>%
+  select_if(is.numeric) %>%
+  select(-loan_defaulted) %>%
+  names() %>%
+  as.list()
+
+num_var_names
+
+for (i in seq(num_var_names)){
+ g <- ggplot(loans01,aes_string(num_var_names[[i]])) + geom_density(aes(color=as.factor(loan_defaulted)))
+  print(g)
+}
+
+
+
+```
+#correlation plot
+```{r}
+#correlation coeff. only
+corr <- loans01 %>% 
+  select_if(is.numeric) %>%
+  #select(-loan_defaulted) %>%
+  cor(use="complete.obs",method="pearson") %>%
+  round(2) %>%
+  as.matrix() %>%
+  melt()
+
+ggplot(data = corr, aes(x=Var1, y=Var2, fill=value)) + geom_tile() + 
+  geom_tile(color = "white")+
+ scale_fill_gradient2(low = "blue", high = "red", mid = "white", 
+   midpoint = 0, limit = c(-1,1), space = "Lab", 
+   name="Pearson\nCorrelation") +
+  theme_minimal()+ 
+ theme(axis.text.x = element_text(angle = 45, vjust = 1, 
+    size = 8, hjust = 1)) +
+ coord_fixed()
+
+
+#p-values for the correlation coeff.
+#loans01 %>% 
+  #select_if(is.numeric) %>%
+  #as.matrix() %>%
+#rcorr(type="pearson")
+```
+
+
+```{r}
+summary(loans01)
+```
+
+#drop more features based on further analysis and create a couple more!
+```{r}
+loans01 <- loans01 %>% 
+  select(-verification_status) %>%
+  select(-pymnt_plan)  %>%
+  select(-earliest_cr_line) %>%
+  select(-earliest_cr_line_date) %>%
+  select(-pub_rec)
+  
+  loans01 <- loans01 %>% select(-zip_code)
+
+loans01$emp_length_na <- as.factor(ifelse(loans01$emp_length=="n/a",1,0))
+
+head(loans01)
+```
+
+#Initialise & set up h2o cluster for modelling
+```{r}
+library(h2o)
+#h2o.shutdown()
+h2o.init(nthreads=-1, max_mem_size = '2g')
+
+```
+
+```{r}
+# Training data: Separate into x and y tibbles
+
+#x_train_tbl <- loans01 %>% select(-loan_defaulted)
+#y_train_tbl <- loans01 %>% select(loan_defaulted)
+
+#y_train_tbl <- y_train_tbl %>% mutate(loan_defaulted = loan_defaulted %>% as.character() %>% as.factor())
+
+#head(x_train_tbl)
+#head(y_train_tbl)
+
+```
+
+#split out ahead of h2o
+```{r}
+smp_siz = floor(0.90*nrow(loans01))  
+smp_siz  # shows the value of the sample size
+
+set.seed(1234)   # set seed to ensure you always have same random numbers generated
+train_ind = sample(seq_len(nrow(loans01)),size = smp_siz)  # Randomly identifies therows equal to sample size ( defined in previous instruction) from  all the rows of Smarket dataset and stores the row number in train_ind
+train =loans01[train_ind,] #creates the training dataset with row numbers stored in train_ind
+holdout=loans01[-train_ind,]  # creates the test dataset excluding the row numbers mentioned in train_ind
+
+head(train)
+head(holdout)
+#train <- train %>% select(-addr_state_high_risk)
+```
+
+#create h2o data set
+```{r}
+#data_h2o <- as.h2o(bind_cols(y_train_tbl, x_train_tbl))
+```
+
+#split out the high risk states where prevalence of default is above apriori
+```{r}
+base <- holdout%>%summarise(base=mean(loan_defaulted))
+base
+
+addr_state_high_risk <- holdout %>% group_by(addr_state) %>% summarise(numerator=sum(loan_defaulted),denominator=n()) %>% mutate(rate=numerator/denominator) %>%  filter(rate > base$base) %>% arrange(desc(rate)) %>% select(addr_state) %>% mutate(addr_state_high_risk_flag=1)
+
+train <- left_join(train, addr_state_high_risk, by="addr_state")
+train$addr_state_high_risk_flag <- as.factor(ifelse(is.na(train$addr_state_high_risk_flag),0,train$addr_state_high_risk_flag))
+
+head(train)
+
+```
+
+#dti - transform
+```{r}
+summary(train$dti)
+train %>% mutate(ntile=ntile(dti,2)) %>% group_by(ntile) %>% summarise(num=sum(loan_defaulted),dem=n()) %>% mutate(rate=num/dem)
+train <- train %>% mutate(dti_ntile=as.factor(ntile(dti,2))) 
+head(train)
+```
+#create feature - funded amt to debt ratio
+```{r}
+train %>% mutate(funded_amnt_debt_ratio = 100*funded_amnt/(annual_inc * (dti/100))) %>% select(dti,funded_amnt,dti_ntile,annual_inc,funded_amnt_debt_ratio) %>% head()
+
+train <- train %>% mutate(funded_amnt_debt_ratio = 100*funded_amnt/(annual_inc * (dti/100)))
+head(train)
+```
+
+#Feature creation - addr_state, grade, purpose
+```{r}
+#encode - by default rates, frequency, mean loan amount
+#create a reusable function
+```
+
+#split into training and holdout set for estimating target encoding mean
+```{r}
+#splits_h2o <- h2o.splitFrame(data_h2o, ratios = c(0.9), seed = 1234)
+
+#train_h2o <- splits_h2o[[1]]
+#te_holdout_h2o <- splits_h2o[[2]]
+
+train_h2o <- as.h2o(train)
+te_holdout_h2o <- as.h2o(holdout)
+
+```
+
+#Creating target encoding map on high cardinality categoricals features - to minimise overfitting in training
+
+```{r}
+te_cols<- c("sub_grade","addr_state")
+
+te_map <- h2o.target_encode_create(te_holdout_h2o, x = as.list(te_cols), y = "loan_defaulted")
+
+te_map$sub_grade
+te_map$addr_state
+
+
+```
+
+
+#Apply the target encoding to the training data set. Use the following param for the training data:
+Holdout_type is none as there is a separate te_holdout set.
+```{r}
+
+ext_train_h2o <- h2o.target_encode_apply(train_h2o, x = as.list(te_cols), y = "loan_defaulted",
+                                     target_encode_map = te_map, 
+                                     holdout_type = "None",
+                                      noise_level = 0,
+                                     seed = 1234
+                                     )
+
+head(ext_train_h2o[c("sub_grade", "TargetEncode_sub_grade")])
+head(ext_train_h2o[c("addr_state", "TargetEncode_addr_state")])
+
+str(ext_train_h2o)
+head(ext_train_h2o)
+```
+
+
+
+#Train model with holdout target encoding. Replace Categorical with TargetEncoded variables.
+
+```{r}
+y <- "loan_defaulted"
+x <- setdiff(names(train_h2o), c(y, te_cols))
+
+tic("Model_Training")
+
+automl_models_h2o <- h2o.glm(
+    x = x,
+    y = y,
+    training_frame    = train_h2o,
+    nfolds = 5,
+    #max_models = 10, #stop when either max of # models built or time runs out.
+    max_runtime_secs  = 90
+        # Early Stopping
+    #stopping_rounds = 5, stopping_metric = "AUC", 
+    #stopping_tolerance = 0.001, seed = 1234
+  
+)
+
+toc()
+
+automl_leader <- automl_models_h2o@leader
+```
+
+#Machine Learning Interpretablitity using LIME
+```{r}
+#LIME - Locally Interpretable Model-agnostic Explanation
+
+library(lime)
+#get predictions
+
+#explain the predictions
+explainer <- lime(biopsy[-test_set,], model, bin_continuous = TRUE, quantile_bins = FALSE)
+explanation <- explain(biopsy[test_set, ], explainer, n_labels = 1, n_features = 4)
+# Only showing part of output for better printing
+explanation[, 2:9]
+
+#We can try to drive firther improvement on the simple model-fit by decreasing the kernel width, thus making the fit more local.
+
+explanation <- explain(biopsy[test_set, ], explainer, n_labels = 1, n_features = 4, kernel_width = 0.5)
+explanation[, 2:9]
+
+#plot the features from simple model
+plot_features(explanation, ncol = 1)
+```
